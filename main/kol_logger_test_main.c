@@ -9,6 +9,13 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
+#include <stdbool.h>
+
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdspi_host.h"
+#include "driver/gpio.h"
+
 #include "esp_mac.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -29,16 +36,18 @@
 
 #include "esp_timer.h"
 
-// using ESP32-S3 SPI2 hardware peripheral to control the LCD
-#define LCD_HOST SPI2_HOST
+// using ESP32-S3 SPI2 hardware peripheral FOR lCD and SD card
+#define SPI_HOST SPI2_HOST
 #define LCD_PIXEL_CLOCK_HZ (10 * 1000 * 1000)
 
 // GPIO
-#define PIN_NUM_MOSI GPIO_NUM_11
-#define PIN_NUM_SCLK GPIO_NUM_12
-#define PIN_NUM_CS   GPIO_NUM_10
-#define PIN_NUM_DC   GPIO_NUM_9
-#define PIN_NUM_RST  GPIO_NUM_14
+#define PIN_NUM_MOSI    GPIO_NUM_11
+#define PIN_NUM_MISO    GPIO_NUM_13
+#define PIN_NUM_SCLK    GPIO_NUM_12
+#define PIN_NUM_LCD_CS  GPIO_NUM_10
+#define PIN_NUM_SD_CS   GPIO_NUM_15
+#define PIN_NUM_DC      GPIO_NUM_9
+#define PIN_NUM_RST     GPIO_NUM_14
 
 // native resolution of the ILI9341 LCD
 #define LCD_H_RES 240
@@ -61,6 +70,18 @@
 #else
 #define GTK_REKEY_INTERVAL 0
 #endif
+
+#define SD_MOUNT_POINT "/sdcard"
+#define SD_MAX_LOG_LINES 20
+
+static sdmmc_card_t *sd_card = NULL;
+static FILE *sd_log_file = NULL;
+
+static uint32_t sd_line_number = 1;
+
+static bool sd_logging_active = false;
+
+static const char *TAG_SD = "SD";
 
 // initialise fake measurements for testing
 typedef struct {
@@ -136,6 +157,190 @@ static void add_sample(const measurement_t *value)
             samples[i] = samples[i+1];
         }
         samples[GRAPH_W-1] = *value;
+    }
+}
+
+// SD initialisation function
+static esp_err_t init_sd_card(void)
+{
+    ESP_LOGI(TAG_SD, "Mounting SD card...");
+
+    // SD card host configuration
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+
+    // using SPI2 bus
+    host.slot = SPI_HOST;
+    host.max_freq_khz = 4000;
+
+    // configure SD card as a device on the SPI2 bus which is shared
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_NUM_SD_CS; // chip select pin for SD card
+    slot_config.host_id = SPI_HOST; // use SPI2 bus
+
+    // FAT filesystem mount configuration
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false, // do not format the card if mounting fails
+        .max_files = 5, // maximum number of files that can be open at the same time
+        .allocation_unit_size = 16 * 1024 // allocation unit size in bytes (16 KB)
+    };
+
+    esp_err_t ret = esp_vfs_fat_sdspi_mount(
+        SD_MOUNT_POINT, // mount point for the SD card
+        &host,          // SD card host configuration
+        &slot_config,   // SD card device configuration
+        &mount_config,  // FAT filesystem mount configuration
+        &sd_card        // pointer to the SD card object (sdmmc_card_t)
+    );
+
+    if (ret != ESP_OK) 
+    {
+        ESP_LOGE(TAG_SD, "Failed to mount SD card: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG_SD, "SD card successfully mounted at %s", SD_MOUNT_POINT);
+
+    sdmmc_card_print_info(stdout, sd_card); // print SD card information to console
+
+    return ESP_OK;
+}
+
+// create SD card log file
+static esp_err_t create_sd_log_file(void)
+{
+    sd_log_file = fopen(SD_MOUNT_POINT"/V001_KOL.TXT", "w"); // w means write mode, will create the file if it does not exist, and overwrite it if it does exist
+
+    if (sd_log_file == NULL) 
+    {
+        ESP_LOGE(TAG_SD, "Failed to create log file on SD card");
+        return ESP_FAIL;
+    }
+
+    // write file header
+    fprintf(sd_log_file, "KOL V1.1\n");
+    fprintf(sd_log_file, "Sample counter 1 (1.0 sec)\n");
+    fprintf(sd_log_file, "\n");
+
+    fprintf(sd_log_file,
+            "%-5s %-12s %-10s %10s %12s %12s %12s %12s %6s\n",
+            "LN",
+            "YYYYMMDD",
+            "HHMMSS",
+            "V",
+            "I",
+            "C",
+            "C+",
+            "C-",
+            "Ts");
+    fflush(sd_log_file); // flush the file buffer to ensure the header is written to the SD card
+
+    sd_line_number = 1; // reset line number for new log file
+
+    sd_logging_active = true; // enable SD card logging
+
+    ESP_LOGI(TAG_SD, "Log file created on SD card: %s/V001_KOL.TXT", SD_MOUNT_POINT);
+
+    return ESP_OK;
+}
+
+// write measurement data (measurement_t) to SD card log file, currently only writing the current value and timestamp
+static void write_sd_measurement(const measurement_t *measurement)
+{
+    // check if SD card logging is active
+    if (!sd_logging_active || sd_log_file == NULL)
+    {
+        return;
+    }
+
+    int64_t elapsed_seconds = measurement->timestamp_ms / 1000; // convert timestamp from ms to s
+
+    // convert elapsed seconds to hours, minutes, seconds
+    int hours = (elapsed_seconds / 3600) % 24;
+    int minutes = (elapsed_seconds / 60) % 60;
+    int seconds = elapsed_seconds % 60;
+
+    float current_A = measurement->current / 1000.0f; // convert mA to A
+
+    // Write one row
+    fprintf(sd_log_file,
+            "%-5lu "
+            "%-12s "
+            "%02lu:%02lu:%02lu "
+            "%10s "
+            "%12.6f "
+            "%12s "
+            "%12s "
+            "%12s "
+            "%6s\n",
+
+            // LN
+            (unsigned long)sd_line_number,
+
+            // YYYYMMDD
+            "NA",
+
+            // HHMMSS
+            (unsigned long)hours,
+            (unsigned long)minutes,
+            (unsigned long)seconds,
+
+            // V
+            "NA",
+
+            // I
+            current_A,
+
+            // C
+            "NA",
+
+            // C+
+            "NA",
+
+            // C-
+            "NA",
+
+            // Ts
+            "NA"
+    );
+    fflush(sd_log_file); // flush the file buffer to ensure the data is written to the SD card
+
+    ESP_LOGI(TAG_SD, "SD line %lu written - Current: %.1f mA", (unsigned long)sd_line_number, measurement->current);
+
+    sd_line_number++; // increment line number for next measurement
+
+    // stop after 20 measurements (for testing purposes)
+    if (sd_line_number > SD_MAX_LOG_LINES)
+    {
+        ESP_LOGI(TAG_SD,
+                 "20 measurements written");
+
+
+        // Flush anything remaining
+        fflush(sd_log_file);
+
+
+        // Close file
+        fclose(sd_log_file);
+
+        sd_log_file = NULL;
+
+
+        // Unmount SD card
+        esp_vfs_fat_sdcard_unmount(
+            SD_MOUNT_POINT,
+            sd_card
+        );
+
+        sd_card = NULL;
+
+        sd_logging_active = false;
+
+
+        ESP_LOGI(TAG_SD,
+                 "SD card unmounted");
+
+        ESP_LOGI(TAG_SD,
+                 "Safe to remove SD card");
     }
 }
 
@@ -274,14 +479,17 @@ static void graph_task(void *pvParameters)
             add_sample(&new_measurement);
             ESP_LOGI(TAG1, "Time: %lld ms, Current: %.1f mA", new_measurement.timestamp_ms, new_measurement.current);
 
+            // write same measurement to SD card log file
+            write_sd_measurement(&new_measurement);
+
             // redraw the graph with the new sample
             draw_graph(panel_handle);
         }
     }
 }
 
-// data_get_handler to return JSON data for current
-// runs whenever someone's browser requests /data (current draw)
+/* data_get_handler to return JSON data for current
+ runs whenever someone's browser requests /data (current draw) */
 static esp_err_t data_get_handler(httpd_req_t *req)
 {
     // buffer to hold JSON response
@@ -530,7 +738,7 @@ void app_main(void)
     // use ESP32 default SPI bus configuration
     spi_bus_config_t bus_config = {
         .mosi_io_num = PIN_NUM_MOSI, // ESP32 sends data to the LCD via this pin from the ESP32's MOSI pin to the LCD's SDI pin
-        .miso_io_num = -1, // not using anything from the LCD, so no need for MISO pin
+        .miso_io_num = PIN_NUM_MISO, // ESP32 receives data from the LCD via this pin from the LCD's SDO pin to the ESP32's MISO pin (not used in this project)
         .sclk_io_num = PIN_NUM_SCLK, // ESP32 provides clock signal to the LCD, via this pin to the LCD's SCLK pin
 
         // using normal SPI mode, so no need for WP and HD pins
@@ -543,8 +751,22 @@ void app_main(void)
     DMA is a hardwired feature of the ESP32 that allows it to transfer data from RAM to a peripheral, in this case this SPI bus, without constant involvement of the CPU
     CPU only needs to be involved when initiating a transfer and when the transfer is complete.
     This is much faster than the CPU doing it, and allows the CPU to do other things while the transfer is happening. */
-    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &bus_config, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI_HOST, &bus_config, SPI_DMA_CH_AUTO));
     
+    if (init_sd_card() == ESP_OK)
+    {
+        if (create_sd_log_file() != ESP_OK)
+        {
+            ESP_LOGE(TAG_SD, "Failed to create log file on SD card");
+
+            esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, sd_card);
+            sd_card = NULL;
+        }
+    }
+    else
+    {
+        ESP_LOGE(TAG_SD, "Failed to initialize SD card");
+    }
 
     // create the LCD panel SPI communication interface
     ESP_LOGI(TAG1, "Creating LCD SPI Interface");
@@ -555,7 +777,7 @@ void app_main(void)
     // use ESP32 LCD SPI IO configuration structure to define how the LCD communicates with the SPI(2) bus
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = PIN_NUM_DC, // ESP32 sends data/command signal to the LCD via this pin from the ESP32's GPIO pin to the LCD's D/C pin
-        .cs_gpio_num = PIN_NUM_CS, // ESP32 selects the LCD via this pin from the ESP32's GPIO pin to the LCD's CS pin
+        .cs_gpio_num = PIN_NUM_LCD_CS, // ESP32 selects the LCD via this pin from the ESP32's GPIO pin to the LCD's CS pin
         .pclk_hz = LCD_PIXEL_CLOCK_HZ, // SPI clock frequency used when communicating with the LCD
         .lcd_cmd_bits = 8, // number of bits in a command
         .lcd_param_bits = 8, // number of bits in a parameter
@@ -564,7 +786,7 @@ void app_main(void)
     };
     // finally create the LCD panel SPI interface using the defined configuration io_config, and provide a handle io_handle, and check for errors
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
-        (esp_lcd_spi_bus_handle_t)LCD_HOST, 
+        (esp_lcd_spi_bus_handle_t)SPI_HOST, 
         &io_config, 
         &io_handle // This handle now contains a pointer to the LCD panel I/O object
     ));
