@@ -74,14 +74,17 @@
 #define SD_MOUNT_POINT "/sdcard"
 #define SD_MAX_LOG_LINES 20
 
+// button
+#define PIN_NUM_RESET_BUTTON GPIO_NUM_4
+static TaskHandle_t reset_button_task_handle = NULL;
+
+
 static sdmmc_card_t *sd_card = NULL;
 static FILE *sd_log_file = NULL;
 
 static uint32_t sd_line_number = 1;
 
-static bool sd_logging_active = false;
-
-static const char *TAG_SD = "SD";
+static bool sd_logging_active = true;
 
 // initialise fake measurements for testing
 typedef struct {
@@ -94,18 +97,78 @@ static measurement_t latest_measurement = {
     .timestamp_ms = 0
 };
 
-static SemaphoreHandle_t measurement_mutex; // mutex to protect access to latest_measurement
+// mutex to protect access to latest_measurement
+static SemaphoreHandle_t measurement_mutex; 
 
 // pointer to queue used by scheduler to hold the fake measurements (this is equivalent to static struct QueueDefinition* measurement_queue)
 static QueueHandle_t measurement_queue;
 
+// array to hold the last GRAPH_W measurements for graphing
 static measurement_t samples[GRAPH_W];
+
+// counter to keep track of how many samples are in the samples array
 static int sample_count = 0;
 
+// flag set by debounced button press, handled by graph task
+static volatile bool reset_requested = false;
 
 // for logging
 static const char *TAG1 = "LCD";
 static const char *TAG = "wifi softAP";
+static const char *TAG_SD = "SD";
+
+
+/*  GPIO ISR, need to keep this short
+    Place function in RAM (IRAM_ATTR)   */
+static void IRAM_ATTR reset_button_isr(void *arg)
+{
+    (void)arg; // avoid compiler warning about unused parameter
+
+    BaseType_t higher_priority_task_woken = pdFALSE;
+
+    // send notification to the reset_button_task with it's handle, this function is safe to use in ISR
+    vTaskNotifyGiveFromISR(reset_button_task_handle, &higher_priority_task_woken);
+
+    // if button task is more important than the current task, yield to it immediately
+    if (higher_priority_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+// task to handle debouncing of button press
+static void reset_button_task(void *pvParameters)
+{
+    (void)pvParameters; // avoid compiler warning about unused parameter
+
+    while (1)
+    {
+        // sleep until GPIO ISR sends a notification to this task
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // debounce the button press
+        vTaskDelay(pdMS_TO_TICKS(30)); // wait 30 ms for button press to settle
+
+        if (gpio_get_level(PIN_NUM_RESET_BUTTON) == 0) // check if button is still pressed (active low)
+        {
+            ESP_LOGI(TAG, "Reset button pressed");
+            reset_requested = true;
+
+            // wait until user releases button
+            while (gpio_get_level(PIN_NUM_RESET_BUTTON) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10)); // check every 10 ms
+            }
+
+            // debounce te release
+            vTaskDelay(pdMS_TO_TICKS(30)); 
+        }
+
+        // clear extra notifications produnced by contact bouncing of the button
+        while (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+            // do nothing
+        }
+    }
+}
+
 
 // this array stores the image that is sent to the LCD. Each pixel is represented by a 16-bit value in RGB565 format.
 static uint16_t frame_buffer[LCD_H_RES * LCD_V_RES];
@@ -462,6 +525,32 @@ static void draw_graph(struct esp_lcd_panel_t *panel_handle)
   ));
 }
 
+static void reset_sd_logging(void)
+{
+
+    ESP_LOGI(TAG_SD, "Resetting SD logging");
+
+    // close the current log file if it is open
+    if (sd_log_file != NULL) 
+    {
+        fflush(sd_log_file); // flush the file buffer to ensure all data is written to the SD card
+        fclose(sd_log_file);
+        sd_log_file = NULL;
+    }
+
+    sd_logging_active = false; // disable SD card logging
+
+    // unmount the SD card if it is mounted
+    if (sd_card != NULL) 
+    {
+        esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, sd_card);
+        sd_card = NULL;
+    }
+
+    // re-initialize the SD card
+    if (init_sd_card() == ESP_OK) {}
+}
+
 // graph task
 static void graph_task(void *pvParameters)
 {
@@ -475,6 +564,27 @@ static void graph_task(void *pvParameters)
         // wait for a new measurement to be available in the queue
         if (xQueueReceive(measurement_queue, &new_measurement, portMAX_DELAY) == pdTRUE)
         {
+            // check if reset button was pressed
+            if (reset_requested)
+            {
+                ESP_LOGI(TAG, "Reset requested, clearing graph and SD logger");
+
+                // reset flag
+                reset_requested = false;
+
+                // clear all graph samples
+                sample_count = 0;
+
+                // clear old measurements
+                memset(samples, 0, sizeof(samples));
+
+                // redraw empty graph
+                draw_graph(panel_handle);
+
+                // restart SD logging
+                reset_sd_logging();
+            }
+
             // store new measurement in the sample array
             add_sample(&new_measurement);
             ESP_LOGI(TAG1, "Time: %lld ms, Current: %.1f mA", new_measurement.timestamp_ms, new_measurement.current);
@@ -839,6 +949,40 @@ void app_main(void)
         ESP_LOGE(TAG1, "Failed to create measurement mutex");
         return;
     }
+
+    // reset button task and GPIO interrupt
+    BaseType_t button_task_result = xTaskCreate(
+        reset_button_task,          // task function
+        "reset_button",             // task name
+        2048,                       // stack size
+        NULL,                       // parameters passed to task (pass the LCD panel handle so the button task can draw to the LCD)
+        4,                          // task priority
+        &reset_button_task_handle   // task handle
+    );
+    if (button_task_result != pdPASS) {
+        ESP_LOGE(TAG1, "Failed to create reset button task");
+        return;
+    }
+
+    gpio_config_t button_config = {
+        .pin_bit_mask = (1ULL << PIN_NUM_RESET_BUTTON),     // select GPIO4  
+        .mode = GPIO_MODE_INPUT,                            // set GPIO4 as input
+        .pull_up_en = GPIO_PULLUP_ENABLE,                   // enable pull-up resistor (internal) 
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,              // disable pull-down resistor (internal)
+        .intr_type = GPIO_INTR_NEGEDGE                      // trigger interrupt on falling edge (button press)
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&button_config)); // apply the button configuration to the GPIO driver and check for errors
+
+    esp_err_t isr_service_result = gpio_install_isr_service(0); // install the GPIO ISR service with default configuration (no flags)
+    if ((isr_service_result != ESP_OK) && (isr_service_result != ESP_ERR_INVALID_STATE)) {
+        ESP_ERROR_CHECK(isr_service_result); // check for errors, but ignore ESP_ERR_INVALID_STATE (ISR service already installed)
+    }
+    ESP_ERROR_CHECK(gpio_isr_handler_add(   // add the ISR handler for GPIO4 (reset button) and check for errors
+        PIN_NUM_RESET_BUTTON,       //GPIO
+        reset_button_isr,           // pointer to ISR function for GPIO4 (reset button)
+        NULL)
+    );
 
     // create empty graph with no samples
     draw_graph(panel_handle);
