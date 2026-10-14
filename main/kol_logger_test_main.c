@@ -4,6 +4,8 @@
 
 #include <string.h>
 
+#include "esp_random.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -50,14 +52,17 @@
 #define PIN_NUM_RST     GPIO_NUM_14
 
 // native resolution of the ILI9341 LCD
-#define LCD_H_RES 240
-#define LCD_V_RES 320
+#define LCD_H_RES 320
+#define LCD_V_RES 240
 
 // graph dimensions
 #define GRAPH_X 20
 #define GRAPH_Y 20
-#define GRAPH_W 200
-#define GRAPH_H 250
+#define GRAPH_W 280
+#define GRAPH_H 190
+
+// current threshhold
+#define CURRENT_THRESHOLD 20.0f
 
 // configuration macros for WiFi settings, defined in project configuration
 #define ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID // preprocessor macro for WiFi SSID from project configuration, associate ESP_WIFI_SSID with CONFIG_ESP_WIFI_SSID
@@ -72,7 +77,7 @@
 #endif
 
 #define SD_MOUNT_POINT "/sdcard"
-#define SD_MAX_LOG_LINES 20
+#define SD_MAX_LOG_LINES 200
 
 // button
 #define PIN_NUM_RESET_BUTTON GPIO_NUM_4
@@ -84,7 +89,7 @@ static FILE *sd_log_file = NULL;
 
 static uint32_t sd_line_number = 1;
 
-static bool sd_logging_active = true;
+static bool sd_logging_active = false;
 
 // initialise fake measurements for testing
 typedef struct {
@@ -113,9 +118,9 @@ static int sample_count = 0;
 static volatile bool reset_requested = false;
 
 // for logging
-static const char *TAG1 = "LCD";
-static const char *TAG = "wifi softAP";
-static const char *TAG_SD = "SD";
+static const char *LCD_TAG = "LCD";
+static const char *WIFI_TAG = "wifi softAP";
+static const char *SD_TAG = "SD";
 
 
 /*  GPIO ISR, need to keep this short
@@ -135,7 +140,7 @@ static void IRAM_ATTR reset_button_isr(void *arg)
     }
 }
 
-// task to handle debouncing of button press
+// task to handle debouncing of button press, it waits for a notification from the GPIO ISR
 static void reset_button_task(void *pvParameters)
 {
     (void)pvParameters; // avoid compiler warning about unused parameter
@@ -150,7 +155,7 @@ static void reset_button_task(void *pvParameters)
 
         if (gpio_get_level(PIN_NUM_RESET_BUTTON) == 0) // check if button is still pressed (active low)
         {
-            ESP_LOGI(TAG, "Reset button pressed");
+            ESP_LOGI(LCD_TAG, "Reset button pressed");
             reset_requested = true;
 
             // wait until user releases button
@@ -183,23 +188,33 @@ static uint16_t rgb565_be(uint16_t colour)
 // freeRTOS task to simulate changing measurements
 static void fake_measurement_task(void *pvParameters)
 {
-    // avoid compiler warning about unused parameter
     (void)pvParameters;
+
     while (1)
     {
-        // generate one measurement per second
+        // Generate one measurement per second
         vTaskDelay(pdMS_TO_TICKS(1000));
 
-        // guarentee queue gets consistent current value and timestamp
-        if (xSemaphoreTake(measurement_mutex, portMAX_DELAY)==pdTRUE)
+        if (xSemaphoreTake(measurement_mutex, portMAX_DELAY) == pdTRUE)
         {
-            latest_measurement.current -= 1.0f;
-            if (latest_measurement.current < 0.0f) {
+            // Generate a random movement between -2.5 mA and +1.0 mA
+            float random_change = ((int)(esp_random() % 36) - 25) / 10.0f;
+
+            latest_measurement.current += random_change;
+
+            // Keep maximum at 100 mA
+            if (latest_measurement.current > 100.0f)
+            {
                 latest_measurement.current = 100.0f;
             }
-            latest_measurement.timestamp_ms = esp_timer_get_time() / 1000; // time in milliseconds since the start of the program
 
-            // send the current measurement to the graph task via the queue (will only contain the latest measurement)
+            // Restart simulation after reaching zero
+            if (latest_measurement.current < 0.0f)
+            {
+                latest_measurement.current = 100.0f;
+            }
+
+            latest_measurement.timestamp_ms = esp_timer_get_time() / 1000;
             xQueueOverwrite(measurement_queue, &latest_measurement);
 
             xSemaphoreGive(measurement_mutex);
@@ -226,7 +241,7 @@ static void add_sample(const measurement_t *value)
 // SD initialisation function
 static esp_err_t init_sd_card(void)
 {
-    ESP_LOGI(TAG_SD, "Mounting SD card...");
+    ESP_LOGI(SD_TAG, "Mounting SD card...");
 
     // SD card host configuration
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
@@ -257,11 +272,11 @@ static esp_err_t init_sd_card(void)
 
     if (ret != ESP_OK) 
     {
-        ESP_LOGE(TAG_SD, "Failed to mount SD card: %s", esp_err_to_name(ret));
+        ESP_LOGE(SD_TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    ESP_LOGI(TAG_SD, "SD card successfully mounted at %s", SD_MOUNT_POINT);
+    ESP_LOGI(SD_TAG, "SD card successfully mounted at %s", SD_MOUNT_POINT);
 
     sdmmc_card_print_info(stdout, sd_card); // print SD card information to console
 
@@ -275,7 +290,7 @@ static esp_err_t create_sd_log_file(void)
 
     if (sd_log_file == NULL) 
     {
-        ESP_LOGE(TAG_SD, "Failed to create log file on SD card");
+        ESP_LOGE(SD_TAG, "Failed to create log file on SD card");
         return ESP_FAIL;
     }
 
@@ -301,7 +316,7 @@ static esp_err_t create_sd_log_file(void)
 
     sd_logging_active = true; // enable SD card logging
 
-    ESP_LOGI(TAG_SD, "Log file created on SD card: %s/V001_KOL.TXT", SD_MOUNT_POINT);
+    ESP_LOGI(SD_TAG, "Log file created on SD card: %s/V001_KOL.TXT", SD_MOUNT_POINT);
 
     return ESP_OK;
 }
@@ -367,15 +382,14 @@ static void write_sd_measurement(const measurement_t *measurement)
     );
     fflush(sd_log_file); // flush the file buffer to ensure the data is written to the SD card
 
-    ESP_LOGI(TAG_SD, "SD line %lu written - Current: %.1f mA", (unsigned long)sd_line_number, measurement->current);
+    ESP_LOGI(SD_TAG, "SD line %lu written - Current: %.1f mA", (unsigned long)sd_line_number, measurement->current);
 
     sd_line_number++; // increment line number for next measurement
 
     // stop after 20 measurements (for testing purposes)
     if (sd_line_number > SD_MAX_LOG_LINES)
     {
-        ESP_LOGI(TAG_SD,
-                 "20 measurements written");
+        ESP_LOGI(SD_TAG,"20 measurements written");
 
 
         // Flush anything remaining
@@ -399,11 +413,9 @@ static void write_sd_measurement(const measurement_t *measurement)
         sd_logging_active = false;
 
 
-        ESP_LOGI(TAG_SD,
-                 "SD card unmounted");
+        ESP_LOGI(SD_TAG,"SD card unmounted");
 
-        ESP_LOGI(TAG_SD,
-                 "Safe to remove SD card");
+        ESP_LOGI(SD_TAG, "Safe to remove SD card");
     }
 }
 
@@ -468,9 +480,10 @@ static void draw_line(int x0, int y0, int x1, int y1, uint16_t colour)
 static void draw_graph(struct esp_lcd_panel_t *panel_handle)
 {
   // RGB565 colour values for the graph
-  uint16_t black = rgb565_be(0x0000); // black
-  uint16_t white = rgb565_be(0xFFFF); // white  
-  uint16_t green = rgb565_be(0x07E0); // green
+  uint16_t black = rgb565_be(0x0000);   
+  uint16_t white = rgb565_be(0xFFFF);     
+  uint16_t green = rgb565_be(0x07E0);   
+  uint16_t red = rgb565_be(0xF800);     
 
   // clear the entire frame buffer to black
   for (int i=0; i < LCD_V_RES*LCD_H_RES; i++)
@@ -509,8 +522,17 @@ static void draw_graph(struct esp_lcd_panel_t *panel_handle)
         int x1 = GRAPH_X + (samples[i].timestamp_ms - start_time) / 1000; // convert milliseconds to seconds
         int y1 = value_to_y(samples[i].current);
 
-        // draw line between the two measurements
-        draw_line(x0, y0, x1, y1, green);   
+        // draw line between the two measurements with colour based on the current value
+        uint16_t line_colour;
+        if (samples[i].current > CURRENT_THRESHOLD) 
+        {
+            line_colour = red; // red if current is above threshold
+        } 
+        else 
+        {
+            line_colour = green; // green if current is below threshold
+        }
+        draw_line(x0, y0, x1, y1, line_colour);   
     }
   }
 
@@ -527,28 +549,44 @@ static void draw_graph(struct esp_lcd_panel_t *panel_handle)
 
 static void reset_sd_logging(void)
 {
+    ESP_LOGI(SD_TAG, "Resetting SD logging");
 
-    ESP_LOGI(TAG_SD, "Resetting SD logging");
-
-    // close the current log file if it is open
-    if (sd_log_file != NULL) 
+    // Close the current log file if oppen
+    if (sd_log_file != NULL)
     {
         fflush(sd_log_file); // flush the file buffer to ensure all data is written to the SD card
-        fclose(sd_log_file);
-        sd_log_file = NULL;
+        fclose(sd_log_file); // now close the file
+
+        sd_log_file = NULL; // reset the file pointer to NULL
     }
 
-    sd_logging_active = false; // disable SD card logging
-
+    // disable SD card logging
+    sd_logging_active = false;
+    
     // unmount the SD card if it is mounted
-    if (sd_card != NULL) 
+    if (sd_card != NULL)
     {
         esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, sd_card);
-        sd_card = NULL;
+        sd_card = NULL; // reset the SD card pointer to NULL}
     }
 
-    // re-initialize the SD card
-    if (init_sd_card() == ESP_OK) {}
+    // remount SD card
+    if (init_sd_card() != ESP_OK) 
+    {
+        ESP_LOGE(SD_TAG, "Failed to re-initialize SD card");
+        return;
+    }
+
+    // create new log file
+    if (create_sd_log_file() != ESP_OK)
+    {
+        ESP_LOGE(SD_TAG, "Failed to create new log file on SD card");
+        esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, sd_card);
+        sd_card = NULL; 
+        return;
+    }
+
+    ESP_LOGI(SD_TAG, "SD logging reset successfully");
 }
 
 // graph task
@@ -567,7 +605,7 @@ static void graph_task(void *pvParameters)
             // check if reset button was pressed
             if (reset_requested)
             {
-                ESP_LOGI(TAG, "Reset requested, clearing graph and SD logger");
+                ESP_LOGI(SD_TAG, "Reset requested, clearing graph and SD logger");
 
                 // reset flag
                 reset_requested = false;
@@ -587,7 +625,7 @@ static void graph_task(void *pvParameters)
 
             // store new measurement in the sample array
             add_sample(&new_measurement);
-            ESP_LOGI(TAG1, "Time: %lld ms, Current: %.1f mA", new_measurement.timestamp_ms, new_measurement.current);
+            ESP_LOGI(LCD_TAG, "Time: %lld ms, Current: %.1f mA", new_measurement.timestamp_ms, new_measurement.current);
 
             // write same measurement to SD card log file
             write_sd_measurement(&new_measurement);
@@ -616,10 +654,12 @@ static esp_err_t data_get_handler(httpd_req_t *req)
 
     // format response as JSON with current value
     snprintf(response,
-             sizeof(response),
-             "{\"current\":%.1f,\"timestamp\":%lld}",
-             latest_measurement_copy.current, latest_measurement_copy.timestamp_ms);
-    
+            sizeof(response),
+            "{\"current\":%.1f,\"timestamp\":%lld,\"threshold\":%.1f}",
+            latest_measurement_copy.current,
+            latest_measurement_copy.timestamp_ms,
+            CURRENT_THRESHOLD);
+        
     // set response type to JSON 
     httpd_resp_set_type(req, "application/json");
     // send response
@@ -643,6 +683,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<link rel=\"icon\" href=\"data:,\">"
 
         "<style>"
+
         "body {"
         "    font-family: Arial, sans-serif;"
         "    text-align: center;"
@@ -659,27 +700,51 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    border-radius: 10px;"
         "}"
 
-        ".value {"
-        "    font-size: 32px;"
+        ".status {"
+        "    font-size: 40px;"
+        "    font-weight: bold;"
+        "    margin: 20px;"
+        "}"
+
+        ".current {"
+        "    font-size: 36px;"
         "    font-weight: bold;"
         "    margin: 10px;"
         "}"
-        "</style>"
 
+        ".info {"
+        "    font-size: 18px;"
+        "    margin: 10px;"
+        "}"
+
+        "</style>"
         "</head>"
+
 
         "<body>"
 
         "<div class=\"card\">"
 
         "<h1>KOL Logger</h1>"
-        "<p>Status: Running</p>"
+
+        "<h2>Measurement Status</h2>"
+
+        "<div class=\"status\" id=\"status\">--</div>"
 
         "<h2>Current Draw</h2>"
-        "<div class=\"value\" id=\"current\">-- mA</div>"
-        "<div class=\"value\" id=\"timestamp\">Time: -- ms</div>"
+
+        "<div class=\"current\" id=\"current\">-- mA</div>"
+
+        "<div class=\"info\" id=\"threshold\">Limit: -- mA</div>"
+
+        "<h2>Elapsed Time</h2>"
+
+        "<div class=\"info\" id=\"elapsed\">--:--:--</div>"
+
+        "<div class=\"info\">Status: Logging</div>"
 
         "</div>"
+
 
         "<script>"
 
@@ -688,16 +753,52 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "    const response = await fetch('/data');"
         "    const data = await response.json();"
 
+        // Current value
         "    document.getElementById('current').textContent = "
         "        data.current.toFixed(1) + ' mA';"
 
-        "    document.getElementById('timestamp').textContent = "
-        "        'Time: ' + data.timestamp + ' ms';"
+        // Threshold value
+        "    document.getElementById('threshold').textContent = "
+        "        'Threshold: ' + data.threshold.toFixed(1) + ' mA';"
+
+
+        // PASS / FAIL
+        "    if (data.current > data.threshold) {"
+
+        "        document.getElementById('status').textContent = 'FAIL';"
+        "        document.getElementById('status').style.color = 'red';"
+        "        document.getElementById('current').style.color = 'red';"
+
+        "    } else {"
+
+        "        document.getElementById('status').textContent = 'PASS';"
+        "        document.getElementById('status').style.color = 'green';"
+        "        document.getElementById('current').style.color = 'green';"
+
+        "    }"
+
+
+        // Convert milliseconds to HH:MM:SS
+        "    const totalSeconds = Math.floor(data.timestamp / 1000);"
+
+        "    const hours = Math.floor(totalSeconds / 3600);"
+        "    const minutes = Math.floor((totalSeconds % 3600) / 60);"
+        "    const seconds = totalSeconds % 60;"
+
+        "    const formattedTime = "
+        "        String(hours).padStart(2, '0') + ':' + "
+        "        String(minutes).padStart(2, '0') + ':' + "
+        "        String(seconds).padStart(2, '0');"
+
+        "    document.getElementById('elapsed').textContent = formattedTime;"
 
         "}"
 
+
+        // Update immediately
         "updateData();"
 
+        // Then update every second
         "setInterval(updateData, 1000);"
 
         "</script>"
@@ -734,7 +835,7 @@ static httpd_handle_t start_webserver(void)
     // Create default configuration 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
-    ESP_LOGI(TAG, "Starting HTTP server");
+    ESP_LOGI(WIFI_TAG, "Starting HTTP server");
 
     if (httpd_start(&server, &config) == ESP_OK) {
 
@@ -742,12 +843,12 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &data_uri);
 
-        ESP_LOGI(TAG, "HTTP server started");
+        ESP_LOGI(WIFI_TAG, "HTTP server started");
 
         return server;
     }
 
-    ESP_LOGE(TAG, "Failed to start HTTP server");
+    ESP_LOGE(WIFI_TAG, "Failed to start HTTP server");
 
     return NULL;
 }
@@ -760,12 +861,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     if (event_id == WIFI_EVENT_AP_STACONNECTED) {
         // // event_data is a pointer to a wifi_event_ap_staconnected_t structure
         wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
-        ESP_LOGI(TAG, "station "MACSTR" join, AID=%d",
+        ESP_LOGI(WIFI_TAG, "station "MACSTR" join, AID=%d",
                  MAC2STR(event->mac), event->aid);
     } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
         // event_data is a pointer to a wifi_event_ap_stadisconnected_t structure
         wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
-        ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d, reason=%d",
+        ESP_LOGI(WIFI_TAG, "station "MACSTR" leave, AID=%d, reason=%d",
                  MAC2STR(event->mac), event->aid, event->reason);
     }
 }
@@ -803,14 +904,9 @@ void wifi_init_softap(void)
             .channel = ESP_WIFI_CHANNEL,
             .password = ESP_WIFI_PASS,
             .max_connection = MAX_STA_CONN,
-#ifdef CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT
-            .authmode = WIFI_AUTH_WPA3_PSK,
-            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
-#else /* CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT */
             .authmode = WIFI_AUTH_WPA2_PSK,
-#endif
             .pmf_cfg = {
-                    .required = true,
+                    .required = false,
             },
 #ifdef CONFIG_ESP_WIFI_BSS_MAX_IDLE_SUPPORT
             .bss_max_idle_cfg = {
@@ -829,7 +925,7 @@ void wifi_init_softap(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());  // start the Wi-Fi driver (ESP32 is now operating as an Access Point)
 
-    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s channel:%d",
+    ESP_LOGI(WIFI_TAG, "wifi_init_softap finished. SSID:%s password:%s channel:%d",
              ESP_WIFI_SSID, ESP_WIFI_PASS, ESP_WIFI_CHANNEL);
 }
 
@@ -844,7 +940,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     // configure the SPI bus
-    ESP_LOGI(TAG1, "Configuring SPI bus");
+    ESP_LOGI(LCD_TAG, "Configuring SPI bus");
     // use ESP32 default SPI bus configuration
     spi_bus_config_t bus_config = {
         .mosi_io_num = PIN_NUM_MOSI, // ESP32 sends data to the LCD via this pin from the ESP32's MOSI pin to the LCD's SDI pin
@@ -858,16 +954,16 @@ void app_main(void)
         .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t), // maximum transfer size possible in bytes
     };
     /*initialize the ESP32-S3 SPI bus (SPI2), using above configuration, and let the driver choose a DMA channel automatically
-    DMA is a hardwired feature of the ESP32 that allows it to transfer data from RAM to a peripheral, in this case this SPI bus, without constant involvement of the CPU
+    DMA is a hardwired feature that the ESP32 has that allows it to transfer data from RAM to a peripheral, in this case, the SPI bus, without constantinvolvement of the CPU
     CPU only needs to be involved when initiating a transfer and when the transfer is complete.
-    This is much faster than the CPU doing it, and allows the CPU to do other things while the transfer is happening. */
+    This is much faster than the CPU doing it all, and allows the CPU to do other things while the transfer is happening. */
     ESP_ERROR_CHECK(spi_bus_initialize(SPI_HOST, &bus_config, SPI_DMA_CH_AUTO));
     
     if (init_sd_card() == ESP_OK)
     {
         if (create_sd_log_file() != ESP_OK)
         {
-            ESP_LOGE(TAG_SD, "Failed to create log file on SD card");
+            ESP_LOGE(SD_TAG, "Failed to create log file on SD card");
 
             esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, sd_card);
             sd_card = NULL;
@@ -875,11 +971,11 @@ void app_main(void)
     }
     else
     {
-        ESP_LOGE(TAG_SD, "Failed to initialize SD card");
+        ESP_LOGE(SD_TAG, "Failed to initialize SD card");
     }
 
     // create the LCD panel SPI communication interface
-    ESP_LOGI(TAG1, "Creating LCD SPI Interface");
+    ESP_LOGI(LCD_TAG, "Creating LCD SPI Interface");
     /* define a pointer to a LCD panel IO object, 
     initially we point it to NULL, but it will be redefined later with esp_lcd_new_panel_io_spi() to create the LCD panel SPI interface
     The I/O object reporesnts the communication interface between the ESP32 and the LCD */
@@ -903,7 +999,7 @@ void app_main(void)
 
 
     // create ILI9341 LCD paneL driver
-    ESP_LOGI(TAG1, "Creating ILI9341 LCD panel driver");
+    ESP_LOGI(LCD_TAG, "Creating ILI9341 LCD panel driver");
     /* define a pointer to a LCD panel object, 
     initially we point it to NULL, but it will be redefined later with esp_lcd_new_panel_ili9341() to create tje ILI9341 LCD panel driver
     The panel object represents the actual LCD controller/driver */
@@ -911,7 +1007,7 @@ void app_main(void)
     // use ESP32 LCD panel device configuration structure to define characteristics of the ILI9341 LCD panel
     esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = PIN_NUM_RST, // ESP32 resets the LCD via this pin from the ESP32's GPIO pin to the LCD's RESET pin
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB, // colour component order, we are using R - G- B order
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR, // colour component order
         .bits_per_pixel = 16, // number of bits per pixel used by the LCD
     };
     // finally create the ILI9341 LCD panel driver using the defined LCD panel I/O SPI interface, configuration panel_config, and provide a handle panel_handle, and check for errors
@@ -923,30 +1019,31 @@ void app_main(void)
 
 
     // reset the LCD
-    ESP_LOGI(TAG1, "Resetting LCD");
+    ESP_LOGI(LCD_TAG, "Resetting LCD");
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
 
     // initialize ILI9341
-    ESP_LOGI(TAG1, "Initializing LCD");
+    ESP_LOGI(LCD_TAG, "Initializing LCD");
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
 
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
+    // ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, false));
 
     // turn the display on
-    ESP_LOGI(TAG1, "Turning on LCD");
+    ESP_LOGI(LCD_TAG, "Turning on LCD");
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
     // create a queue to hold the latest measurement, with a length of 1 (only the latest measurement is needed)
     measurement_queue = xQueueCreate(1, sizeof(measurement_t));
     if (measurement_queue == NULL) {
-        ESP_LOGE(TAG1, "Failed to create measurement queue");
+        ESP_LOGE(LCD_TAG, "Failed to create measurement queue");
         return;
     }
 
     // create a mutex to protect access to latest_measurement
     measurement_mutex = xSemaphoreCreateMutex();
     if (measurement_mutex == NULL) {
-        ESP_LOGE(TAG1, "Failed to create measurement mutex");
+        ESP_LOGE(LCD_TAG, "Failed to create measurement mutex");
         return;
     }
 
@@ -955,12 +1052,12 @@ void app_main(void)
         reset_button_task,          // task function
         "reset_button",             // task name
         2048,                       // stack size
-        NULL,                       // parameters passed to task (pass the LCD panel handle so the button task can draw to the LCD)
+        NULL,                       // nothing is passed to the task
         4,                          // task priority
         &reset_button_task_handle   // task handle
     );
     if (button_task_result != pdPASS) {
-        ESP_LOGE(TAG1, "Failed to create reset button task");
+        ESP_LOGE(LCD_TAG, "Failed to create reset button task");
         return;
     }
 
@@ -987,7 +1084,7 @@ void app_main(void)
     // create empty graph with no samples
     draw_graph(panel_handle);
 
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_AP");
+    ESP_LOGI(WIFI_TAG, "ESP_WIFI_MODE_AP");
     wifi_init_softap();
 
     start_webserver();
@@ -1011,5 +1108,5 @@ void app_main(void)
     NULL                    // task handle
     );
 
-    ESP_LOGI(TAG1, "Done!");
+    ESP_LOGI(LCD_TAG, "Done!");
 }

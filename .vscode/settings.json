@@ -33,5 +33,6 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\linal\\Projects\\KOL_Logger_Test\\build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.port": "COM5"
 }
