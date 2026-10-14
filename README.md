@@ -11,6 +11,8 @@
 
 ## TO-DO
 * Polish graph display on LCD screen
+* Complete adding button reset (using ISR approach)
+* Utilise DS3231 real time clock
 * Obtain real current readings. Currently using dynamically changing current (mA) for testing purposes
 * Polish Logger Printed Circuit Board
 * Design Measurement Printed Circuit Board
