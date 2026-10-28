@@ -2,7 +2,7 @@
 ## Currently Done
 * ESP32 acts as a wifi access point (AP)
 * ESP32 hosts dynamic website displaying measurement data - the current (mA) and associated timestamp 
-* LCD screen (ili9341) displays a rough dynamic graph of the measurement data using SPI
+* LCD screen (ili9341) displays a dynamic graph of the measurement data using SPI
 * added button reset (using a GPIO interrupt service routine approach)
 * measurement data has timestamps from when ESP32 boots up
 * mutex protection for measurement data
@@ -11,9 +11,8 @@
   ![PCB 3D View](PCB_img.png)
 
 ## TO-DO
-* Polish graph display on LCD screen
 * Utilise DS3231 real time clock
-* Obtain real current readings. Currently using dynamically changing current (mA) for testing purposes
+* Obtain real current readings. Currently using dynamically and randomly changing current (mA) for testing purposes
 * Polish Logger Printed Circuit Board
 * Design Measurement Printed Circuit Board
 * Test Printed Circuit Board
